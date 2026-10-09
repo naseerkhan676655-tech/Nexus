@@ -1,0 +1,1062 @@
+name: Nexus Auto Setup
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/nexus-setup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Git config
+        run: |
+          git config user.name "Nexus Bot"
+          git config user.email "bot@nexus.local"
+
+      - name: Prepare dirs
+        run: |
+          mkdir -p app/src/main/java/com/nexus/app
+          mkdir -p app/src/main/res/values
+          rm -f .github/workflows/build.yml
+          rm -f .github/workflows/android.yml
+          rm -f .github/workflows/release.yml
+          rm -f .github/workflows/cdn-release.yml
+
+      - name: Write build.gradle
+        run: |
+          cat > app/build.gradle << 'GRADLE_EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.nexus.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.nexus.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 4
+                  versionName "0.4.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              buildFeatures { compose true }
+              composeOptions { kotlinCompilerExtensionVersion '1.5.8' }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
+              implementation 'androidx.activity:activity-compose:1.8.2'
+              implementation platform('androidx.compose:compose-bom:2024.02.00')
+              implementation 'androidx.compose.ui:ui'
+              implementation 'androidx.compose.ui:ui-graphics'
+              implementation 'androidx.compose.material3:material3'
+              implementation 'androidx.compose.material:material-icons-extended'
+              implementation 'org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5'
+          }
+          GRADLE_EOF
+
+      - name: Write Manifest
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'MANIFEST_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.FLASHLIGHT"/>
+              <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.SEND_SMS"/>
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission"/>
+              <uses-feature android:name="android.hardware.camera" android:required="false"/>
+              <uses-feature android:name="android.hardware.camera.flash" android:required="false"/>
+              <queries>
+                  <intent><action android:name="android.intent.action.VIEW"/><data android:scheme="https"/></intent>
+                  <intent><action android:name="android.intent.action.DIAL"/></intent>
+                  <intent><action android:name="android.intent.action.SENDTO"/></intent>
+                  <intent><action android:name="android.intent.action.SEND"/></intent>
+                  <intent><action android:name="android.media.action.IMAGE_CAPTURE"/></intent>
+                  <intent><action android:name="android.speech.RecognitionService"/></intent>
+              </queries>
+              <application
+                  android:allowBackup="true"
+                  android:label="Nexus"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/Theme.Nexus"
+                  tools:targetApi="34">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".ScreenCaptureService"
+                      android:enabled="true" android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+              </application>
+          </manifest>
+          MANIFEST_EOF
+
+      - name: Write ScreenCaptureService
+        run: |
+          cat > app/src/main/java/com/nexus/app/ScreenCaptureService.kt << 'SCS_EOF'
+          package com.nexus.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.MediaRecorder
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import androidx.core.app.NotificationCompat
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class ScreenCaptureService : Service() {
+              companion object {
+                  const val ACTION_SET_PROJECTION = "nexus.SET"
+                  const val ACTION_SCREENSHOT = "nexus.SHOT"
+                  const val ACTION_START_RECORD = "nexus.STREC"
+                  const val ACTION_STOP_RECORD = "nexus.SPREC"
+                  const val EXTRA_RESULT_CODE = "rc"
+                  const val EXTRA_DATA = "data"
+                  var hasProjection = false
+                  var isRecording = false
+                  var lastScreenshotPath: String? = null
+                  var lastError: String? = null
+              }
+
+              private var projection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var imageReader: ImageReader? = null
+              private var recorder: MediaRecorder? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startFg()
+                  when (intent?.action) {
+                      ACTION_SET_PROJECTION -> setProj(intent)
+                      ACTION_SCREENSHOT -> shot()
+                      ACTION_START_RECORD -> startRec()
+                      ACTION_STOP_RECORD -> stopRec()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun startFg() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val ch = NotificationChannel("nexus_svc", "Nexus", NotificationManager.IMPORTANCE_LOW)
+                      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+                  }
+                  val n: Notification = NotificationCompat.Builder(this, "nexus_svc")
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setContentTitle("Nexus").setContentText("Screen capture").setOngoing(true).build()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+              }
+
+              private fun setProj(i: Intent) {
+                  try {
+                      val rc = i.getIntExtra(EXTRA_RESULT_CODE, 0)
+                      val d = i.getParcelableExtra<Intent>(EXTRA_DATA) ?: return
+                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      projection?.stop()
+                      projection = mpm.getMediaProjection(rc, d)
+                      hasProjection = projection != null
+                      lastError = null
+                  } catch (e: Exception) { lastError = e.message; hasProjection = false }
+              }
+
+              private fun shot() {
+                  val mp = projection ?: run { lastError = "No projection"; return }
+                  try {
+                      val dm = resources.displayMetrics
+                      val w = dm.widthPixels; val h = dm.heightPixels
+                      imageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                      virtualDisplay = mp.createVirtualDisplay("NX", w, h, dm.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, imageReader?.surface, null, null)
+                      Handler(Looper.getMainLooper()).postDelayed({
+                          try {
+                              val img = imageReader?.acquireLatestImage()
+                              if (img != null) {
+                                  val p = img.planes
+                                  val buf = p[0].buffer
+                                  val ps = p[0].pixelStride
+                                  val rs = p[0].rowStride
+                                  val rp = rs - ps * w
+                                  val bmp = Bitmap.createBitmap(w + rp / ps, h, Bitmap.Config.ARGB_8888)
+                                  bmp.copyPixelsFromBuffer(buf)
+                                  val c = Bitmap.createBitmap(bmp, 0, 0, w, h)
+                                  val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+                                  if (!dir.exists()) dir.mkdirs()
+                                  val f = File(dir, "Nexus_${System.currentTimeMillis()}.png")
+                                  FileOutputStream(f).use { c.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                                  lastScreenshotPath = f.absolutePath
+                                  img.close()
+                              } else lastError = "No image"
+                          } catch (e: Exception) { lastError = e.message }
+                          try { virtualDisplay?.release() } catch (_: Exception) {}
+                          try { imageReader?.close() } catch (_: Exception) {}
+                      }, 700)
+                  } catch (e: Exception) { lastError = e.message }
+              }
+
+              private fun startRec() {
+                  val mp = projection ?: run { lastError = "No projection"; return }
+                  if (isRecording) return
+                  try {
+                      val dm = resources.displayMetrics
+                      val w = dm.widthPixels; val h = dm.heightPixels
+                      val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+                      if (!dir.exists()) dir.mkdirs()
+                      val f = File(dir, "NexusRec_${System.currentTimeMillis()}.mp4")
+                      recorder = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this)
+                          else @Suppress("DEPRECATION") MediaRecorder()).apply {
+                          setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                          setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                          setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                          setVideoSize(w, h)
+                          setVideoFrameRate(30)
+                          setVideoEncodingBitRate(5000000)
+                          setOutputFile(f.absolutePath)
+                          prepare()
+                      }
+                      virtualDisplay = mp.createVirtualDisplay("NXR", w, h, dm.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, recorder?.surface, null, null)
+                      recorder?.start()
+                      isRecording = true
+                      lastError = null
+                  } catch (e: Exception) { lastError = e.message; isRecording = false }
+              }
+
+              private fun stopRec() {
+                  try { recorder?.stop() } catch (_: Exception) {}
+                  try { recorder?.release() } catch (_: Exception) {}
+                  try { virtualDisplay?.release() } catch (_: Exception) {}
+                  recorder = null; virtualDisplay = null; isRecording = false
+              }
+
+              override fun onDestroy() { stopRec(); super.onDestroy() }
+          }
+          SCS_EOF
+
+      - name: Write MainActivity
+        run: |
+          cat > app/src/main/java/com/nexus/app/MainActivity.kt << 'MAIN_EOF'
+          package com.nexus.app
+
+          import android.Manifest
+          import android.app.ActivityManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraManager
+          import android.location.LocationManager
+          import android.media.AudioManager
+          import android.media.RingtoneManager
+          import android.media.projection.MediaProjectionManager
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.StatFs
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.os.VibratorManager
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.speech.RecognizerIntent
+          import android.speech.tts.TextToSpeech
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.eclipse.paho.client.mqttv3.MqttClient
+          import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+          import org.eclipse.paho.client.mqttv3.MqttMessage
+          import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+          import org.json.JSONObject
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+          import java.io.OutputStreamWriter
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.Locale
+
+          private val Bg = Color(0xFF0A0A0F)
+          private val Bg2 = Color(0xFF12121A)
+          private val Bg3 = Color(0xFF1A1A24)
+          private val Border = Color(0xFF26262F)
+          private val Text = Color(0xFFE8E8F0)
+          private val TextDim = Color(0xFF8A8A96)
+          private val Accent = Color(0xFF00D4FF)
+          private val Success = Color(0xFF10B981)
+          private val Danger = Color(0xFFEF4444)
+
+          object FlashState { var on by mutableStateOf(false) }
+          object TTSHolder { var tts: TextToSpeech? = null }
+
+          object MqttM {
+              private var c: MqttClient? = null
+              var isConnected by mutableStateOf(false)
+              var status by mutableStateOf("Not connected")
+              val log = mutableStateListOf<String>()
+              var myId by mutableStateOf("")
+
+              fun connect(room: String, id: String, onMsg: (String) -> Unit) {
+                  try {
+                      myId = id
+                      c = MqttClient("tcp://broker.hivemq.com:1883",
+                          "nx_${id}_${System.currentTimeMillis()}", MemoryPersistence())
+                      c?.connect(MqttConnectOptions().apply {
+                          isAutomaticReconnect = true; isCleanSession = true; connectionTimeout = 15
+                      })
+                      c?.subscribe("nexus_v4_$room") { _, m -> onMsg(String(m.payload)) }
+                      isConnected = true; status = "Connected - $room"
+                      log.add(0, "✓ Connected")
+                  } catch (e: Exception) { isConnected = false; status = "Err: ${e.message}" }
+              }
+              fun pub(room: String, p: String) {
+                  try { c?.publish("nexus_v4_$room", MqttMessage(p.toByteArray()).apply { qos = 1 }) } catch (_: Exception) {}
+              }
+              fun disc() {
+                  try { c?.disconnect(); c?.close() } catch (_: Exception) {}
+                  c = null; isConnected = false; status = "Disconnected"; log.clear()
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val ch = NotificationChannel("nexus", "Nexus", NotificationManager.IMPORTANCE_DEFAULT)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+                  }
+                  setContent { App() }
+              }
+              override fun onDestroy() { TTSHolder.tts?.shutdown(); super.onDestroy() }
+          }
+
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              var tab by remember { mutableStateOf("remote") }
+              val permL = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
+              LaunchedEffect(Unit) {
+                  permL.launch(arrayOf(
+                      Manifest.permission.ACCESS_FINE_LOCATION,
+                      Manifest.permission.ACCESS_COARSE_LOCATION,
+                      Manifest.permission.POST_NOTIFICATIONS,
+                      Manifest.permission.CAMERA,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.SEND_SMS))
+                  TTSHolder.tts = TextToSpeech(ctx) {}
+              }
+              Surface(color = Bg, modifier = Modifier.fillMaxSize()) {
+                  Column(Modifier.fillMaxSize()) {
+                      Box(Modifier.fillMaxWidth().background(Bg2).padding(14.dp)) {
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                              verticalAlignment = Alignment.CenterVertically) {
+                              Text("NEXUS v0.4", color = Accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                              if (MqttM.isConnected) Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Box(Modifier.size(8.dp).background(Success, RoundedCornerShape(4.dp)))
+                                  Spacer(Modifier.width(6.dp)); Text("LIVE", color = Success, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                              }
+                          }
+                      }
+                      Box(Modifier.weight(1f)) {
+                          when (tab) {
+                              "remote" -> RemoteS(ctx)
+                              "device" -> DeviceS(ctx)
+                              "tools" -> ToolsS(ctx)
+                              "ai" -> AIS(ctx)
+                          }
+                      }
+                      Row(Modifier.fillMaxWidth().background(Bg2).padding(8.dp),
+                          horizontalArrangement = Arrangement.SpaceEvenly) {
+                          NB("Remote", "remote", tab) { tab = it }
+                          NB("Device", "device", tab) { tab = it }
+                          NB("Tools", "tools", tab) { tab = it }
+                          NB("AI", "ai", tab) { tab = it }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun NB(l: String, id: String, cur: String, cb: (String) -> Unit) {
+              Column(Modifier.clickable { cb(id) }.padding(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text(l, color = if (cur == id) Accent else TextDim, fontSize = 11.sp,
+                      fontWeight = if (cur == id) FontWeight.Bold else FontWeight.Normal)
+              }
+          }
+
+          @Composable
+          fun RemoteS(ctx: Context) {
+              val prefs = remember { ctx.getSharedPreferences("np", Context.MODE_PRIVATE) }
+              val did = remember { prefs.getString("did", null) ?: run {
+                  val i = "dev_" + (100000..999999).random(); prefs.edit().putString("did", i).apply(); i } }
+              var room by remember { mutableStateOf(prefs.getString("room", "") ?: "") }
+              val scope = rememberCoroutineScope()
+              Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+                  Text("Remote Control", color = Text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(4.dp))
+                  Text("Same room code dono phones me", color = TextDim, fontSize = 11.sp)
+                  Spacer(Modifier.height(14.dp))
+                  Box(Modifier.fillMaxWidth().background(Bg2, RoundedCornerShape(10.dp)).padding(12.dp)) {
+                      Column {
+                          Text("Device ID", color = TextDim, fontSize = 10.sp)
+                          Text(did, color = Accent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                      }
+                  }
+                  Spacer(Modifier.height(10.dp))
+                  OutlinedTextField(value = room, onValueChange = { room = it.trim() },
+                      placeholder = { Text("Room Code", color = TextDim, fontSize = 13.sp) },
+                      modifier = Modifier.fillMaxWidth(), singleLine = true,
+                      colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Accent,
+                          unfocusedBorderColor = Border, focusedTextColor = Text, unfocusedTextColor = Text))
+                  Spacer(Modifier.height(8.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = {
+                          if (room.isBlank()) { Toast.makeText(ctx, "Room daalo", Toast.LENGTH_SHORT).show(); return@Button }
+                          prefs.edit().putString("room", room).apply()
+                          scope.launch(Dispatchers.IO) { MqttM.connect(room, did) { p ->
+                              scope.launch(Dispatchers.Main) { handleRem(ctx, p) } } }
+                      }, enabled = !MqttM.isConnected, modifier = Modifier.weight(1f),
+                          colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
+                          Text("Connect", color = Color.Black, fontWeight = FontWeight.Bold)
+                      }
+                      Button(onClick = { scope.launch(Dispatchers.IO) { MqttM.disc() } },
+                          enabled = MqttM.isConnected, modifier = Modifier.weight(1f),
+                          colors = ButtonDefaults.buttonColors(containerColor = Danger)) {
+                          Text("Disconnect", color = Color.White, fontWeight = FontWeight.Bold)
+                      }
+                  }
+                  Spacer(Modifier.height(10.dp))
+                  Box(Modifier.fillMaxWidth().background(Bg2, RoundedCornerShape(10.dp)).padding(12.dp)) {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Box(Modifier.size(10.dp).background(if (MqttM.isConnected) Success else Danger, RoundedCornerShape(5.dp)))
+                          Spacer(Modifier.width(8.dp)); Text(MqttM.status, color = Text, fontSize = 12.sp)
+                      }
+                  }
+                  Spacer(Modifier.height(14.dp))
+                  if (MqttM.isConnected) {
+                      Text("Send Command", color = Text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.height(8.dp))
+                      val cmds = listOf("Ring" to "ring", "Vibrate" to "vibrate", "Location" to "location",
+                          "Battery" to "battery", "Notify" to "notify", "Clipboard" to "clipboard",
+                          "Flash" to "flash", "Toast" to "toast", "Speak" to "speak")
+                      LazyVerticalGrid(columns = GridCells.Fixed(3),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          verticalArrangement = Arrangement.spacedBy(8.dp),
+                          modifier = Modifier.height(200.dp)) {
+                          items(cmds) { p ->
+                              Box(Modifier.background(Bg3, RoundedCornerShape(10.dp))
+                                  .clickable {
+                                      val msg = JSONObject().apply { put("from", did); put("action", p.second) }.toString()
+                                      scope.launch(Dispatchers.IO) { MqttM.pub(room, msg)
+                                          withContext(Dispatchers.Main) { MqttM.log.add(0, "→ ${p.first}") } }
+                                  }.padding(12.dp), contentAlignment = Alignment.Center) {
+                                  Text(p.first, color = Text, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                              }
+                          }
+                      }
+                      Spacer(Modifier.height(14.dp))
+                  }
+                  Text("Log", color = Text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(6.dp))
+                  Box(Modifier.fillMaxWidth().height(200.dp).background(Bg2, RoundedCornerShape(12.dp)).padding(12.dp)) {
+                      if (MqttM.log.isEmpty()) Text("No activity", color = TextDim, fontSize = 12.sp)
+                      else LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                          items(MqttM.log.size) { i -> Text(MqttM.log[i], color = Text, fontSize = 11.sp) }
+                      }
+                  }
+              }
+          }
+
+          fun handleRem(ctx: Context, p: String) {
+              try {
+                  val j = JSONObject(p)
+                  val from = j.optString("from", "")
+                  val a = j.optString("action", "")
+                  if (from == MqttM.myId) return
+                  val r = when (a) {
+                      "ring" -> { val u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                          ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                          RingtoneManager.getRingtone(ctx, u).play(); "✓ Ring" }
+                      "vibrate" -> { vib(ctx, 1500); "✓ Vibrate" }
+                      "location" -> locS(ctx)
+                      "battery" -> { val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                          "🔋 ${bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)}%" }
+                      "notify" -> { notif(ctx, "Remote", "From ${from.takeLast(6)}"); "✓ Notif" }
+                      "clipboard" -> { val cb = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          val c = cb.primaryClip
+                          if (c == null || c.itemCount == 0) "📋 Empty" else "📋 ${c.getItemAt(0).coerceToText(ctx)}" }
+                      "flash" -> tFlash(ctx)
+                      "toast" -> { Toast.makeText(ctx, "Remote!", Toast.LENGTH_LONG).show(); "✓ Toast" }
+                      "speak" -> { TTSHolder.tts?.speak("Remote command", TextToSpeech.QUEUE_FLUSH, null, "n"); "✓ Speak" }
+                      else -> "?"
+                  }
+                  MqttM.log.add(0, "← ${from.takeLast(6)}: $a\n  $r")
+              } catch (e: Exception) { MqttM.log.add(0, "✗ ${e.message}") }
+          }
+
+          fun vib(ctx: Context, ms: Long) {
+              val v = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                  (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+              else @Suppress("DEPRECATION") ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                  v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+              else @Suppress("DEPRECATION") v.vibrate(ms)
+          }
+
+          fun notif(ctx: Context, t: String, b: String) {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                  ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS)
+                  != PackageManager.PERMISSION_GRANTED) return
+              val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+              nm.notify(System.currentTimeMillis().toInt(), NotificationCompat.Builder(ctx, "nexus")
+                  .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle(t).setContentText(b)
+                  .setAutoCancel(true).build())
+          }
+
+          fun locS(ctx: Context): String {
+              if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION)
+                  != PackageManager.PERMISSION_GRANTED) return "✗ No perm"
+              val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+              val l = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                  ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+              return if (l == null) "⏳ No loc" else "📍 ${l.latitude}, ${l.longitude}"
+          }
+
+          fun tFlash(ctx: Context): String {
+              return try {
+                  val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  val id = cm.cameraIdList.firstOrNull { c ->
+                      cm.getCameraCharacteristics(c)
+                          .get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                  } ?: return "✗ No flash"
+                  FlashState.on = !FlashState.on
+                  cm.setTorchMode(id, FlashState.on)
+                  if (FlashState.on) "✓ Flash ON" else "✓ Flash OFF"
+              } catch (e: Exception) { "✗ ${e.message}" }
+          }
+
+          @Composable
+          fun DeviceS(ctx: Context) {
+              var info by remember { mutableStateOf("Loading...") }
+              val sc = rememberCoroutineScope()
+              LaunchedEffect(Unit) { info = devInfo(ctx) }
+              Column(Modifier.fillMaxSize().padding(20.dp).verticalScroll(rememberScrollState())) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically) {
+                      Text("Device Info", color = Text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                      Text("Refresh", color = Accent, fontSize = 12.sp,
+                          modifier = Modifier.clickable { sc.launch { info = devInfo(ctx) } })
+                  }
+                  Spacer(Modifier.height(14.dp))
+                  Box(Modifier.fillMaxWidth().background(Bg2, RoundedCornerShape(12.dp)).padding(16.dp)) {
+                      Text(info, color = Text, fontSize = 13.sp)
+                  }
+              }
+          }
+
+          fun devInfo(ctx: Context): String {
+              val s = StringBuilder()
+              s.appendLine("📱 DEVICE")
+              s.appendLine("Model: ${Build.MANUFACTURER} ${Build.MODEL}")
+              s.appendLine("Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+              s.appendLine()
+              val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+              val lvl = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+              val bi = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+              val st = bi?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+              val ch = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+              val tp = (bi?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10.0
+              s.appendLine("🔋 BATTERY")
+              s.appendLine("Level: $lvl%")
+              s.appendLine("Status: ${if (ch) "Charging" else "Not"}")
+              s.appendLine("Temp: $tp°C")
+              s.appendLine()
+              val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+              val mi = ActivityManager.MemoryInfo(); am.getMemoryInfo(mi)
+              val tR = mi.totalMem / (1024.0 * 1024 * 1024)
+              val uR = (mi.totalMem - mi.availMem) / (1024.0 * 1024 * 1024)
+              s.appendLine("🧠 RAM: ${"%.2f".format(uR)} / ${"%.2f".format(tR)} GB")
+              s.appendLine()
+              try {
+                  val st2 = StatFs(Environment.getDataDirectory().path)
+                  val tot = st2.blockCountLong * st2.blockSizeLong / (1024.0 * 1024 * 1024)
+                  val av = st2.availableBlocksLong * st2.blockSizeLong / (1024.0 * 1024 * 1024)
+                  s.appendLine("💾 STORAGE")
+                  s.appendLine("Used: ${"%.2f".format(tot - av)} / ${"%.2f".format(tot)} GB")
+                  s.appendLine("Free: ${"%.2f".format(av)} GB")
+                  s.appendLine()
+              } catch (_: Exception) {}
+              val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+              val nc = cm.getNetworkCapabilities(cm.activeNetwork)
+              val t = when {
+                  nc == null -> "None"
+                  nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WiFi"
+                  nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Mobile"
+                  else -> "Other"
+              }
+              s.appendLine("📶 NETWORK: $t")
+              if (t == "WiFi") try {
+                  val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                  val ip = wm.connectionInfo.ipAddress
+                  s.appendLine("IP: ${ip and 0xff}.${(ip shr 8) and 0xff}.${(ip shr 16) and 0xff}.${(ip shr 24) and 0xff}")
+              } catch (_: Exception) {}
+              return s.toString()
+          }
+
+          @Composable
+          fun ToolsS(ctx: Context) {
+              var out by remember { mutableStateOf("Tap any tool...") }
+              var url by remember { mutableStateOf("google.com") }
+              var ph by remember { mutableStateOf("") }
+              var ttsT by remember { mutableStateOf("Hello from Nexus") }
+              var ready by remember { mutableStateOf(ScreenCaptureService.hasProjection) }
+              var rec by remember { mutableStateOf(ScreenCaptureService.isRecording) }
+
+              val projL = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  if (r.resultCode == android.app.Activity.RESULT_OK && r.data != null) {
+                      val i = Intent(ctx, ScreenCaptureService::class.java).apply {
+                          action = ScreenCaptureService.ACTION_SET_PROJECTION
+                          putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, r.resultCode)
+                          putExtra(ScreenCaptureService.EXTRA_DATA, r.data)
+                      }
+                      ContextCompat.startForegroundService(ctx, i); ready = true; out = "✓ Access granted"
+                  } else out = "✗ Denied"
+              }
+              val spL = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  if (r.resultCode == android.app.Activity.RESULT_OK) {
+                      val t = r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+                      if (t != null) out = "🎤 Heard: $t"
+                  }
+              }
+              val camL = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  if (r.resultCode == android.app.Activity.RESULT_OK) out = "✓ Photo in Gallery" else out = "✗ Cancelled"
+              }
+
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      delay(1500)
+                      ScreenCaptureService.lastScreenshotPath?.let { out = "✓ Saved: $it"; ScreenCaptureService.lastScreenshotPath = null }
+                      ScreenCaptureService.lastError?.let { out = "✗ $it"; ScreenCaptureService.lastError = null }
+                      ready = ScreenCaptureService.hasProjection
+                      rec = ScreenCaptureService.isRecording
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().padding(14.dp).verticalScroll(rememberScrollState())) {
+                  Text("Tools", color = Text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(4.dp))
+                  Text("Sab real ✅", color = Success, fontSize = 11.sp)
+                  Spacer(Modifier.height(12.dp))
+
+                  OutlinedTextField(value = url, onValueChange = { url = it },
+                      label = { Text("URL", color = TextDim, fontSize = 11.sp) },
+                      modifier = Modifier.fillMaxWidth(), singleLine = true,
+                      colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Accent,
+                          unfocusedBorderColor = Border, focusedTextColor = Text, unfocusedTextColor = Text))
+                  Spacer(Modifier.height(6.dp))
+                  OutlinedTextField(value = ph, onValueChange = { ph = it },
+                      label = { Text("Number", color = TextDim, fontSize = 11.sp) },
+                      modifier = Modifier.fillMaxWidth(), singleLine = true,
+                      colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Accent,
+                          unfocusedBorderColor = Border, focusedTextColor = Text, unfocusedTextColor = Text))
+                  Spacer(Modifier.height(6.dp))
+                  OutlinedTextField(value = ttsT, onValueChange = { ttsT = it },
+                      label = { Text("Text to speak", color = TextDim, fontSize = 11.sp) },
+                      modifier = Modifier.fillMaxWidth(), singleLine = true,
+                      colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Accent,
+                          unfocusedBorderColor = Border, focusedTextColor = Text, unfocusedTextColor = Text))
+                  Spacer(Modifier.height(14.dp))
+
+                  Text("Screen Capture", color = TextDim, fontSize = 11.sp)
+                  Spacer(Modifier.height(6.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = {
+                          val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                          projL.launch(mpm.createScreenCaptureIntent())
+                      }, modifier = Modifier.weight(1f),
+                          colors = ButtonDefaults.buttonColors(containerColor = if (ready) Success else Accent)) {
+                          Text(if (ready) "✓ Access" else "Grant", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                      }
+                      Button(onClick = {
+                          if (!ScreenCaptureService.hasProjection) { out = "✗ Pehle Grant"; return@Button }
+                          ContextCompat.startForegroundService(ctx, Intent(ctx, ScreenCaptureService::class.java).apply {
+                              action = ScreenCaptureService.ACTION_SCREENSHOT })
+                          out = "⏳ Screenshot..."
+                      }, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
+                          Text("Screenshot", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                      }
+                  }
+                  Spacer(Modifier.height(6.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = {
+                          if (!ScreenCaptureService.hasProjection) { out = "✗ Pehle Grant"; return@Button }
+                          ContextCompat.startForegroundService(ctx, Intent(ctx, ScreenCaptureService::class.java).apply {
+                              action = ScreenCaptureService.ACTION_START_RECORD })
+                          rec = true; out = "⏺ Recording..."
+                      }, enabled = !rec, modifier = Modifier.weight(1f),
+                          colors = ButtonDefaults.buttonColors(containerColor = Danger)) {
+                          Text("● Rec", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                      }
+                      Button(onClick = {
+                          ctx.startService(Intent(ctx, ScreenCaptureService::class.java).apply {
+                              action = ScreenCaptureService.ACTION_STOP_RECORD })
+                          rec = false; out = "✓ Saved to Movies"
+                      }, enabled = rec, modifier = Modifier.weight(1f),
+                          colors = ButtonDefaults.buttonColors(containerColor = Success)) {
+                          Text("■ Stop", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                      }
+                  }
+                  Spacer(Modifier.height(14.dp))
+
+                  val tools = listOf("📸 Camera", "📳 Vibrate", "💬 Toast", "🔔 Notify", "🔊 Ring",
+                      "📍 Location", "📋 Clipboard", "🔦 Flash", "🔊 Vol Max", "🔇 Vol Mute",
+                      "☀️ Bright Max", "🌙 Bright Min", "🌐 URL", "📞 Dial", "✉️ SMS",
+                      "📲 Share", "📦 Apps", "⚙️ App Info", "🗣️ Speak", "🎤 Listen",
+                      "📶 WiFi", "🔋 Batt Set", "📡 Data", "⚙️ Settings", "🕐 Time",
+                      "📂 Downloads", "🖼️ Photos", "🎥 Videos")
+                  LazyVerticalGrid(columns = GridCells.Fixed(2),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp),
+                      verticalArrangement = Arrangement.spacedBy(8.dp),
+                      modifier = Modifier.height(880.dp)) {
+                      items(tools) { t ->
+                          Box(Modifier.background(Bg2, RoundedCornerShape(10.dp))
+                              .clickable {
+                                  out = when (t) {
+                                      "📸 Camera" -> {
+                                          val i = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                                          if (i.resolveActivity(ctx.packageManager) != null) { camL.launch(i); "⏳ Camera" }
+                                          else "✗ No camera"
+                                      }
+                                      "🗣️ Speak" -> { TTSHolder.tts?.speak(ttsT, TextToSpeech.QUEUE_FLUSH, null, "n"); "🗣️ Speaking" }
+                                      "🎤 Listen" -> {
+                                          val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                              putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                              putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                                              putExtra(RecognizerIntent.EXTRA_PROMPT, "Bolo...")
+                                          }
+                                          try { spL.launch(i); "🎤 Listening" } catch (e: Exception) { "✗ No speech" }
+                                      }
+                                      "🌐 URL" -> oUrl(ctx, url)
+                                      "📞 Dial" -> dNum(ctx, ph)
+                                      "✉️ SMS" -> sNum(ctx, ph)
+                                      "📲 Share" -> shTx(ctx, url)
+                                      "📦 Apps" -> lApps(ctx)
+                                      "⚙️ App Info" -> oInfo(ctx)
+                                      "📶 WiFi" -> oSet(ctx, Settings.ACTION_WIFI_SETTINGS)
+                                      "🔋 Batt Set" -> oSet(ctx, "android.settings.BATTERY_SAVER_SETTINGS")
+                                      "📡 Data" -> oSet(ctx, Settings.ACTION_DATA_ROAMING_SETTINGS)
+                                      "⚙️ Settings" -> oSet(ctx, Settings.ACTION_SETTINGS)
+                                      "🕐 Time" -> "🕐 ${java.text.SimpleDateFormat("dd MMM yyyy, HH:mm:ss", Locale.getDefault()).format(java.util.Date())}"
+                                      "📂 Downloads" -> lDir(ctx, Environment.DIRECTORY_DOWNLOADS)
+                                      "🖼️ Photos" -> lDir(ctx, Environment.DIRECTORY_PICTURES)
+                                      "🎥 Videos" -> lDir(ctx, Environment.DIRECTORY_MOVIES)
+                                      else -> runT(ctx, t)
+                                  }
+                              }.padding(14.dp), contentAlignment = Alignment.Center) {
+                              Text(t, color = Text, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                          }
+                      }
+                  }
+
+                  Spacer(Modifier.height(14.dp))
+                  Text("Output:", color = TextDim, fontSize = 11.sp)
+                  Spacer(Modifier.height(6.dp))
+                  Box(Modifier.fillMaxWidth().background(Bg2, RoundedCornerShape(12.dp)).padding(16.dp)) {
+                      Text(out, color = Accent, fontSize = 12.sp)
+                  }
+              }
+          }
+
+          fun runT(ctx: Context, t: String): String {
+              return try {
+                  when (t) {
+                      "📳 Vibrate" -> { vib(ctx, 1000); "✓ Vibrate" }
+                      "💬 Toast" -> { Toast.makeText(ctx, "Hello!", Toast.LENGTH_LONG).show(); "✓ Toast" }
+                      "🔔 Notify" -> { notif(ctx, "Nexus", "Test"); "✓ Notif" }
+                      "🔊 Ring" -> { val u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                          ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                          RingtoneManager.getRingtone(ctx, u).play(); "✓ Ring" }
+                      "📍 Location" -> locS(ctx)
+                      "📋 Clipboard" -> { val cb = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          val c = cb.primaryClip
+                          if (c == null || c.itemCount == 0) "📋 Empty" else "📋 ${c.getItemAt(0).coerceToText(ctx)}" }
+                      "🔦 Flash" -> tFlash(ctx)
+                      "🔊 Vol Max" -> { val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0); "✓ Max" }
+                      "🔇 Vol Mute" -> { val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                          am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0); "✓ Muted" }
+                      "☀️ Bright Max" -> sBr(ctx, 255)
+                      "🌙 Bright Min" -> sBr(ctx, 10)
+                      else -> "?"
+                  }
+              } catch (e: Exception) { "✗ ${e.message}" }
+          }
+
+          fun sBr(ctx: Context, v: Int): String = try {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                  if (!Settings.System.canWrite(ctx)) {
+                      val i = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
+                      i.data = Uri.parse("package:${ctx.packageName}")
+                      ctx.startActivity(i)
+                      "⚠️ Allow 'Modify system settings'"
+                  } else { Settings.System.putInt(ctx.contentResolver, Settings.System.SCREEN_BRIGHTNESS, v); "✓ Set" }
+              } else "⚠️ Not supported"
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          fun oUrl(ctx: Context, u: String): String = try {
+              val f = if (!u.startsWith("http")) "https://$u" else u
+              ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(f))); "✓ Opening"
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          fun dNum(ctx: Context, n: String): String {
+              if (n.isBlank()) return "✗ Number daalo"
+              return try { ctx.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$n"))); "✓ Dialer" }
+              catch (e: Exception) { "✗ ${e.message}" }
+          }
+
+          fun sNum(ctx: Context, n: String): String {
+              if (n.isBlank()) return "✗ Number daalo"
+              return try { ctx.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$n"))); "✓ SMS" }
+              catch (e: Exception) { "✗ ${e.message}" }
+          }
+
+          fun shTx(ctx: Context, t: String): String = try {
+              ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                  type = "text/plain"; putExtra(Intent.EXTRA_TEXT, t) }, "Share")); "✓ Share"
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          fun lApps(ctx: Context): String = try {
+              val pm = ctx.packageManager
+              val a = pm.getInstalledApplications(0)
+              val s = StringBuilder("📦 ${a.size}\n\n")
+              a.take(30).forEach { s.appendLine("• ${pm.getApplicationLabel(it)}") }
+              if (a.size > 30) s.appendLine("\n+${a.size - 30} more")
+              s.toString()
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          fun oInfo(ctx: Context): String = try {
+              val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+              i.data = Uri.parse("package:${ctx.packageName}"); ctx.startActivity(i); "✓ Opened"
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          fun oSet(ctx: Context, a: String): String = try {
+              ctx.startActivity(Intent(a)); "✓ Opened"
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          fun lDir(ctx: Context, d: String): String = try {
+              val dir = Environment.getExternalStoragePublicDirectory(d)
+              if (dir == null || !dir.exists()) return "📂 Empty"
+              val f = dir.listFiles() ?: return "📂 Empty"
+              if (f.isEmpty()) return "📂 Empty"
+              val s = StringBuilder("📂 $d (${f.size})\n\n")
+              f.sortedByDescending { it.lastModified() }.take(20).forEach { x ->
+                  s.appendLine("• ${x.name}${if (x.isFile) " (${x.length()/1024}KB)" else "/"}")
+              }
+              s.toString()
+          } catch (e: Exception) { "✗ ${e.message}" }
+
+          @Composable
+          fun AIS(ctx: Context) {
+              val prefs = remember { ctx.getSharedPreferences("np", Context.MODE_PRIVATE) }
+              var k by remember { mutableStateOf(prefs.getString("k", "") ?: "") }
+              var sk by remember { mutableStateOf(k.isBlank()) }
+              var ki by remember { mutableStateOf(k) }
+              var inp by remember { mutableStateOf("") }
+              var ld by remember { mutableStateOf(false) }
+              val ms = remember { mutableStateListOf<Pair<String, Boolean>>("Salam! API key set karo phir poocho" to false) }
+              val sc = rememberCoroutineScope()
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically) {
+                      Text("AI Chat", color = Text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                      Text(if (sk) "Hide" else "Set Key", color = Accent, fontSize = 12.sp,
+                          modifier = Modifier.clickable { sk = !sk; ki = k })
+                  }
+                  if (sk) { Spacer(Modifier.height(8.dp))
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          OutlinedTextField(value = ki, onValueChange = { ki = it },
+                              placeholder = { Text("Groq key gsk_...", color = TextDim, fontSize = 12.sp) },
+                              modifier = Modifier.weight(1f),
+                              colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Accent,
+                                  unfocusedBorderColor = Border, focusedTextColor = Text, unfocusedTextColor = Text))
+                          Spacer(Modifier.width(8.dp))
+                          Button(onClick = { k = ki.trim(); prefs.edit().putString("k", k).apply(); sk = false },
+                              colors = ButtonDefaults.buttonColors(containerColor = Accent)) { Text("Save", color = Color.Black) }
+                      }
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  LazyColumn(Modifier.weight(1f).fillMaxWidth().background(Bg2, RoundedCornerShape(12.dp)).padding(12.dp),
+                      verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(ms.size) { i ->
+                          val (t, u) = ms[i]
+                          Box(Modifier.fillMaxWidth(), contentAlignment = if (u) Alignment.CenterEnd else Alignment.CenterStart) {
+                              Text(t, color = if (u) Color.Black else Text, fontSize = 13.sp,
+                                  modifier = Modifier.background(if (u) Accent else Bg3, RoundedCornerShape(10.dp)).padding(10.dp))
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      OutlinedTextField(value = inp, onValueChange = { inp = it },
+                          placeholder = { Text("Poocho...", color = TextDim) }, modifier = Modifier.weight(1f),
+                          colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = Accent,
+                              unfocusedBorderColor = Border, focusedTextColor = Text, unfocusedTextColor = Text))
+                      Spacer(Modifier.width(8.dp))
+                      Button(onClick = {
+                          val t = inp.trim()
+                          if (t.isBlank() || ld) return@Button
+                          if (k.isBlank()) { ms.add("Pehle key set karo" to false); return@Button }
+                          ms.add(t to true); inp = ""; ld = true; ms.add("Soch raha..." to false)
+                          val idx = ms.size - 1
+                          sc.launch { val r = gq(k, t); ms[idx] = r to false; ld = false }
+                      }, enabled = !ld, colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
+                          Text(if (ld) "..." else "Send", color = Color.Black)
+                      }
+                  }
+              }
+          }
+
+          suspend fun gq(k: String, m: String): String = withContext(Dispatchers.IO) {
+              try {
+                  val u = URL("https://api.groq.com/openai/v1/chat/completions")
+                  val c = u.openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.setRequestProperty("Content-Type", "application/json")
+                  c.setRequestProperty("Authorization", "Bearer $k")
+                  c.connectTimeout = 30000; c.readTimeout = 30000; c.doOutput = true
+                  val e = m.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+                  val b = "{\"model\":\"llama-3.1-8b-instant\",\"messages\":[{\"role\":\"system\",\"content\":\"You are Nexus. Reply short in Roman Urdu/English.\"},{\"role\":\"user\",\"content\":\"$e\"}],\"temperature\":0.7}"
+                  OutputStreamWriter(c.outputStream).use { it.write(b) }
+                  val rc = c.responseCode
+                  if (rc != 200) { val er = c.errorStream?.bufferedReader()?.readText() ?: ""
+                      return@withContext "Error $rc\n${er.take(150)}" }
+                  val r = BufferedReader(InputStreamReader(c.inputStream)).readText()
+                  c.disconnect()
+                  JSONObject(r).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+              } catch (e: Exception) { "Error: ${e.message}" }
+          }
+          MAIN_EOF
+
+      - name: Write build workflow
+        run: |
+          cat > .github/workflows/build-apk.yml << 'BW_EOF'
+          name: Build APK to CDN
+          on:
+            push: { branches: [ main ] }
+            workflow_dispatch:
+          permissions: { contents: write }
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-java@v4
+                  with: { distribution: 'temurin', java-version: '17' }
+                - uses: gradle/actions/setup-gradle@v4
+                  with: { gradle-version: 8.5 }
+                - run: gradle assembleDebug --no-daemon
+                - name: Prepare APK
+                  run: |
+                    mkdir -p deploy
+                    cp app/build/outputs/apk/debug/app-debug.apk deploy/Nexus.apk
+                - name: Push to CDN branch
+                  run: |
+                    cd deploy
+                    git init
+                    git checkout -b cdn
+                    git config user.name "Nexus Bot"
+                    git config user.email "bot@nexus.local"
+                    git add .
+                    git commit -m "Build ${{ github.run_number }}"
+                    git push -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git cdn
+          BW_EOF
+
+      - name: Commit and push
+        run: |
+          git add -A
+          git commit -m "Auto-setup v0.4: All tools + Screenshot + Video" || echo "No changes"
+          git push
